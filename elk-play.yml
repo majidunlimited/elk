@@ -1,0 +1,356 @@
+---
+
+- name: Install ELK
+  hosts: ELKServers
+  remote_user: root
+
+  vars:
+    nexus: "NEXUS SERVER URL/repository"
+    apt_proxy: "/apt-proxy/"
+    apt_hosted: "/apt-hosted/"
+    nexus_components: "main restricted universe multiverse"
+    elk_version: "7.16.3"
+    cert_dir: "/etc/elasticsearch/certs"
+    ca_dir: "{{ cert_dir }}/ca"
+    es_node_cert: "{{ cert_dir }}/elasticsearch"
+    server_ip_addrs: "SERVER IP ADDRESS"
+    es_node_name: "node01"
+    ca_pass: "PASSWORD FOR CA"
+    userpassword: "PASSWORD FOR ELASTICSEARCH USERS"
+    elasticsearch_url: "https://{{ server_ip_addrs }}:9200"
+    kibana_cert: "/etc/kibana/certs"
+    kibana_url: "https://{{ server_ip_addrs }}:5601"
+    logstash_cert: "/etc/logstash/certs"
+
+  tasks:
+    - name: Set time and date
+      community.general.timezone:
+        name: Asia/Tehran
+
+    - name: Download Nexus APT public key from Nexus RAW repo
+      ansible.builtin.get_url:
+        url: "{{ nexus }}/raw-keys/root/gpg/apt/public.gpg.key"
+        dest: "/usr/share/keyrings/nexus-apt.asc"
+        mode: "0644"
+
+    - name: Ensure gpg is installed
+      ansible.builtin.apt:
+        name: gnupg
+        state: present
+        update_cache: yes
+
+    - name: Dearmor Nexus APT key
+      ansible.builtin.command:
+        cmd: "gpg --dearmor -o /usr/share/keyrings/public.gpg.key /usr/share/keyrings/nexus-apt.asc"
+      args:
+        creates: "/usr/share/keyrings/public.gpg.key"
+
+    - name: Add Nexus Repo to source.list
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list
+        mode: "0644"
+        content: |
+          deb [trusted=yes] {{ nexus }}{{ apt_proxy }} jammy {{ nexus_components }}
+          deb [trusted=yes] {{ nexus }}{{ apt_proxy }} jammy-updates {{ nexus_components }}
+          deb [trusted=yes] {{ nexus }}{{ apt_proxy }} jammy-security {{ nexus_components }}
+          deb [trusted=yes] {{ nexus }}{{ apt_hosted }} jammy main
+
+    - name: Apt update
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Prerequisites
+      ansible.builtin.apt:
+        pkg:
+        - nano
+        - vim
+        - curl
+        - wget
+        - kibana={{ elk_version }}
+        - elasticsearch={{ elk_version }}
+        - logstash=1:7.16.3-1
+        - unzip
+
+    - name: Create or check cert directories for elasticsearch
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: elasticsearch
+        group: elasticsearch
+        mode: "0750"
+      loop:
+        - "{{ cert_dir }}"
+        - "{{ ca_dir }}"
+        - "{{ es_node_cert }}"
+
+    - name: Create Elastic CA zip file
+      ansible.builtin.command: >
+        /usr/share/elasticsearch/bin/elasticsearch-certutil ca
+        --days 3650
+        --keysize 4096
+        --out /etc/elasticsearch/certs/ca/ca.zip
+        --pem
+        --pass "{{ ca_pass }}"
+      args:
+        creates: "{{ ca_dir }}/ca.zip"
+
+    - name: Unzip CA.zip file
+      ansible.builtin.unarchive:
+        src: "{{ cert_dir }}/ca/ca.zip"
+        dest: "{{ cert_dir }}/ca/"
+        remote_src: true
+
+    - name: Create ES node cert signed by CA
+      ansible.builtin.command: >
+        /usr/share/elasticsearch/bin/elasticsearch-certutil cert
+        --ca-cert "{{ ca_dir }}/ca/ca.crt"
+        --ca-pass "{{ ca_pass }}"
+        --days 3650
+        --ip "{{ server_ip_addrs }}"
+        --keysize 4096
+        --out "{{ es_node_cert }}/elasticsearch.zip"
+        --pem
+        --ca-key "{{ ca_dir }}/ca/ca.key"
+      args:
+        creates: "{{ es_node_cert }}/elasticsearch.zip"
+
+    - name: Unzip elasticsearch zip file
+      ansible.builtin.unarchive:
+        src: "{{ es_node_cert }}/elasticsearch.zip"
+        dest: "{{ es_node_cert }}"
+        remote_src: true
+
+    - name: Set Bootstrap Password Environment variable Using random password
+      ansible.builtin.set_fact:
+         bootstrap_password: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') }}"
+
+    - name: Check if bootstrap.password exists in keystore
+      ansible.builtin.command:
+        argv:
+          - /usr/share/elasticsearch/bin/elasticsearch-keystore
+          - list
+      register: keystore_list
+      changed_when: false
+
+    - name: Set Bootstrap Password in keystore
+      ansible.builtin.command:
+        argv:
+          - /usr/share/elasticsearch/bin/elasticsearch-keystore
+          - add
+          - -x
+          - bootstrap.password
+        stdin: "{{ bootstrap_password }}"
+      when: "'bootstrap.password' not in keystore_list.stdout"
+
+    - name: Configure Elasticsearch SSL (http + transport)
+      ansible.builtin.blockinfile:
+        path: /etc/elasticsearch/elasticsearch.yml
+        marker: "########## {mark} ANSIBLE MANAGED SSL"
+        block: |
+          node.name: "{{ es_node_name }}"
+          network.host: "{{ server_ip_addrs }}"
+          discovery.type: single-node
+          xpack.security.enabled: true
+
+          # HTTP (9200)
+          xpack.security.http.ssl.enabled: true
+          xpack.security.http.ssl.verification_mode: certificate
+          xpack.security.http.ssl.certificate: "{{ es_node_cert }}/instance/instance.crt"
+          xpack.security.http.ssl.key: "{{ es_node_cert }}/instance/instance.key"
+          xpack.security.http.ssl.certificate_authorities: [ "{{ ca_dir }}/ca/ca.crt" ]
+
+          # TRANSPORT (9300)
+          xpack.security.transport.ssl.enabled: true
+          xpack.security.transport.ssl.verification_mode: certificate
+          xpack.security.transport.ssl.certificate: "{{ es_node_cert }}/instance/instance.crt"
+          xpack.security.transport.ssl.key: "{{ es_node_cert }}/instance/instance.key"
+          xpack.security.transport.ssl.certificate_authorities: [ "{{ ca_dir }}/ca/ca.crt" ]
+
+          discovery.seed_hosts: [ "{{ server_ip_addrs }}" ]
+
+    - name: Restart Elasticsearch service
+      ansible.builtin.service:
+        name: elasticsearch
+        enabled: yes
+        state: restarted
+
+    - name: Wait for Elasticsearch to respond
+      ansible.builtin.uri:
+        url: "{{ elasticsearch_url }}"
+        method: GET
+        validate_certs: false
+        status_code: [200, 401]
+      register: es_ping
+      retries: 30
+      delay: 2
+      until: es_ping.status in [200, 401]
+
+
+    - name: Set password for elasticsearch users
+      ansible.builtin.shell: |
+        set -euo pipefail
+        for User in kibana_system logstash_system apm_system beats_system elastic; do
+          curl -sS -k -u "elastic:{{ bootstrap_password }}" \
+            -X POST "{{ elasticsearch_url }}/_xpack/security/user/${User}/_password" \
+            -H "Content-Type: application/json" \
+            -d "{\"password\":\"{{ userpassword }}\"}"
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Kibana cert directory
+      ansible.builtin.file:
+        path: "{{ kibana_cert }}"
+        state: directory
+        owner: kibana
+        group: kibana
+        mode: "0750"
+
+    - name: Copy CA cert to Kibana without key
+      ansible.builtin.copy:
+        src: "{{ ca_dir }}/ca/ca.crt"
+        dest: "{{ kibana_cert }}/ca.crt"
+        owner: kibana
+        group: kibana
+        mode: "0644"
+        remote_src: true
+
+    - name: Create Kibana server cert signed by CA
+      ansible.builtin.command:
+        argv:
+          - /usr/share/elasticsearch/bin/elasticsearch-certutil
+          - cert
+          - --pem
+          - --days
+          - "3650"
+          - --keysize
+          - "4096"
+          - --ca-cert
+          - "{{ ca_dir }}/ca/ca.crt"
+          - --ca-key
+          - "{{ ca_dir }}/ca/ca.key"
+          - --ca-pass
+          - "{{ ca_pass }}"
+          - --name
+          - kibana
+          - --dns
+          - "{{ inventory_hostname }}"
+          - --ip
+          - "{{ server_ip_addrs }}"
+          - --out
+          - "{{ kibana_cert }}/kibana.zip"
+      args:
+        creates: "{{ kibana_cert }}/kibana.zip"
+    - name: Unzip Kibana cert
+      ansible.builtin.unarchive:
+        src: "{{ kibana_cert }}/kibana.zip"
+        dest: "{{ kibana_cert }}"
+        remote_src: true
+
+    - name: Set kibana cert permissions
+      ansible.builtin.shell: |
+        set -e
+        chown -R kibana:kibana "{{ kibana_cert }}"
+        chmod 0750 "{{ kibana_cert }}"
+        chmod 0644 "{{ kibana_cert }}/ca.crt"
+        chmod 0640 "{{ kibana_cert }}/kibana/kibana.crt" "{{ kibana_cert }}/kibana/kibana.key"
+      args:
+        executable: /bin/bash
+
+    - name: Configure Kibana SSL on 5601 and Elasticsearch SSL connection
+      ansible.builtin.blockinfile:
+        path: /etc/kibana/kibana.yml
+        marker: "########## {mark} ANSIBLE MANAGED SSL"
+        block: |
+          server.host: "0.0.0.0"
+          server.ssl.enabled: true
+          server.ssl.certificate: "{{ kibana_cert }}/kibana/kibana.crt"
+          server.ssl.key: "{{ kibana_cert }}/kibana/kibana.key"
+
+          elasticsearch.hosts: ["{{ elasticsearch_url }}"]
+          elasticsearch.ssl.certificateAuthorities: ["{{ kibana_cert }}/ca.crt"]
+          elasticsearch.ssl.verificationMode: certificate
+          elasticsearch.username: "kibana_system"
+          elasticsearch.password: "{{ userpassword }}"
+
+    - name: Restart Kibana service
+      ansible.builtin.service:
+        name: kibana
+        enabled: yes
+        state: restarted
+
+    - name: Logstash cert directory
+      ansible.builtin.file:
+        path: "{{ logstash_cert }}"
+        state: directory
+        owner: logstash
+        group: logstash
+        mode: "0750"
+
+    - name: Copy CA cert to Logstash
+      ansible.builtin.copy:
+        src: "{{ ca_dir }}/ca/ca.crt"
+        dest: "{{ logstash_cert }}/ca.crt"
+        owner: logstash
+        group: logstash
+        mode: "0644"
+        remote_src: true
+    - name: Create Logstash cert signed by CA
+      ansible.builtin.command:
+        argv:
+          - /usr/share/elasticsearch/bin/elasticsearch-certutil
+          - cert
+          - --pem
+          - --days
+          - "3650"
+          - --keysize
+          - "4096"
+          - --ca-cert
+          - "{{ ca_dir }}/ca/ca.crt"
+          - --ca-key
+          - "{{ ca_dir }}/ca/ca.key"
+          - --ca-pass
+          - "{{ ca_pass }}"
+          - --name
+          - logstash
+          - --dns
+          - "{{ inventory_hostname }}"
+          - --ip
+          - "{{ server_ip_addrs }}"
+          - --out
+          - "{{ logstash_cert }}/logstash.zip"
+      args:
+        creates: "{{ logstash_cert }}/logstash.zip"
+
+    - name: Unzip Logstash cert
+      ansible.builtin.unarchive:
+        src: "{{ logstash_cert }}/logstash.zip"
+        dest: "{{ logstash_cert }}"
+        remote_src: true
+
+    - name: Set Logstash cert permissions
+      ansible.builtin.shell: |
+        set -e
+        chown -R logstash:logstash "{{ logstash_cert }}"
+        chmod 0750 "{{ logstash_cert }}"
+        chmod 0644 "{{ logstash_cert }}/ca.crt"
+        chmod 0640 "{{ logstash_cert }}/logstash/logstash.crt" "{{ logstash_cert }}/logstash/logstash.key"
+      args:
+        executable: /bin/bash
+
+    - name: Configure Logstash output to Elasticsearch with SSL
+      ansible.builtin.copy:
+        dest: /etc/logstash/conf.d/99-output-elasticsearch.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          output {
+            elasticsearch {
+              hosts => ["{{ elasticsearch_url }}"]
+              user => "logstash_system"
+              password => "{{ userpassword }}"
+              ssl => true
+              cacert => "/etc/logstash/certs/ca.crt"
+            }
+          }
