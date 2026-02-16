@@ -5,7 +5,7 @@
   remote_user: root
 
   vars:
-    nexus: "NEXUS SERVER URL/repository"
+    nexus: "Nexus Repo URL"
     apt_proxy: "/apt-proxy/"
     apt_hosted: "/apt-hosted/"
     nexus_components: "main restricted universe multiverse"
@@ -13,10 +13,10 @@
     cert_dir: "/etc/elasticsearch/certs"
     ca_dir: "{{ cert_dir }}/ca"
     es_node_cert: "{{ cert_dir }}/elasticsearch"
-    server_ip_addrs: "SERVER IP ADDRESS"
+    server_ip_addrs: "Target ip"
     es_node_name: "node01"
-    ca_pass: "PASSWORD FOR CA"
-    userpassword: "PASSWORD FOR ELASTICSEARCH USERS"
+    ca_pass: "changeme"
+    userpassword: "changeme"
     elasticsearch_url: "https://{{ server_ip_addrs }}:9200"
     kibana_cert: "/etc/kibana/certs"
     kibana_url: "https://{{ server_ip_addrs }}:5601"
@@ -41,9 +41,9 @@
 
     - name: Dearmor Nexus APT key
       ansible.builtin.command:
-        cmd: "gpg --dearmor -o /usr/share/keyrings/public.gpg.key /usr/share/keyrings/nexus-apt.asc"
+        cmd: "gpg --dearmor -o /usr/share/keyrings/nexus-apt.gpg /usr/share/keyrings/nexus-apt.asc"
       args:
-        creates: "/usr/share/keyrings/public.gpg.key"
+        creates: "/usr/share/keyrings/nexus-apt.gpg"
 
     - name: Add Nexus Repo to source.list
       ansible.builtin.copy:
@@ -53,7 +53,7 @@
           deb [trusted=yes] {{ nexus }}{{ apt_proxy }} jammy {{ nexus_components }}
           deb [trusted=yes] {{ nexus }}{{ apt_proxy }} jammy-updates {{ nexus_components }}
           deb [trusted=yes] {{ nexus }}{{ apt_proxy }} jammy-security {{ nexus_components }}
-          deb [trusted=yes] {{ nexus }}{{ apt_hosted }} jammy main
+          deb [signed-by=/usr/share/keyrings/nexus-apt.gpg] {{ nexus }}{{ apt_hosted }} jammy main
 
     - name: Apt update
       ansible.builtin.apt:
@@ -70,6 +70,7 @@
         - elasticsearch={{ elk_version }}
         - logstash=1:7.16.3-1
         - unzip
+        - net-tools
 
     - name: Create or check cert directories for elasticsearch
       ansible.builtin.file:
@@ -114,7 +115,7 @@
       args:
         creates: "{{ es_node_cert }}/elasticsearch.zip"
 
-    - name: Unzip elasticsearch zip file
+    - name: Unzip elasticsearch.zip file
       ansible.builtin.unarchive:
         src: "{{ es_node_cert }}/elasticsearch.zip"
         dest: "{{ es_node_cert }}"
@@ -241,6 +242,7 @@
           - "{{ kibana_cert }}/kibana.zip"
       args:
         creates: "{{ kibana_cert }}/kibana.zip"
+
     - name: Unzip Kibana cert
       ansible.builtin.unarchive:
         src: "{{ kibana_cert }}/kibana.zip"
@@ -262,16 +264,32 @@
         path: /etc/kibana/kibana.yml
         marker: "########## {mark} ANSIBLE MANAGED SSL"
         block: |
+          server.port: 5601
           server.host: "0.0.0.0"
           server.ssl.enabled: true
-          server.ssl.certificate: "{{ kibana_cert }}/kibana/kibana.crt"
-          server.ssl.key: "{{ kibana_cert }}/kibana/kibana.key"
-
+          server.ssl.certificate: {{ kibana_cert }}/kibana/kibana.crt
+          server.ssl.key: {{ kibana_cert }}/kibana/kibana.key
           elasticsearch.hosts: ["{{ elasticsearch_url }}"]
-          elasticsearch.ssl.certificateAuthorities: ["{{ kibana_cert }}/ca.crt"]
-          elasticsearch.ssl.verificationMode: certificate
           elasticsearch.username: "kibana_system"
           elasticsearch.password: "{{ userpassword }}"
+          elasticsearch.ssl.certificateAuthorities: [ "{{ kibana_cert }}/ca.crt" ]
+
+          #I set these parameters too:
+          xpack.security.session.idleTimeout: "1h"
+          xpack.security.session.lifespan: "30d"
+          xpack.security.session.cleanupInterval: "1d"
+          xpack.security.cookieName: "Douran"
+          xpack.security.secureCookies: "true"
+          xpack.security.sameSiteCookies: "Lax"
+          xpack.security.audit.enabled: true
+          server.ssl.supportedProtocols: ["TLSv1.2"]
+          server.cors.enabled: "true"
+          server.cors.allowCredentials: false
+          server.securityResponseHeaders.xContentTypeOptions: "nosniff"
+          server.securityResponseHeaders.referrerPolicy: "strict-origin-when-cross-origin"
+
+          # Elastic stack Private Repository
+          #xpack.fleet.registryUrl: "http://EPR-Server"      #If you have Epr server.
 
     - name: Restart Kibana service
       ansible.builtin.service:
@@ -295,6 +313,7 @@
         group: logstash
         mode: "0644"
         remote_src: true
+
     - name: Create Logstash cert signed by CA
       ansible.builtin.command:
         argv:
@@ -354,3 +373,35 @@
               cacert => "/etc/logstash/certs/ca.crt"
             }
           }
+
+    - name: Crack elk
+      ansible.builtin.copy:
+        src: ./elk/x-pack-core-7.16.3.jar
+        dest: /usr/share/elasticsearch/modules/x-pack-core/x-pack-core-7.16.3.jar
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart kibana and elasticsearch
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+      loop:
+        - elasticsearch
+        - kibana
+
+    - name: Make elastic-agent directory
+      file:
+        path: /root/elstic-agent
+        state: directory
+
+    - name: Download and extract elastic-agent
+      ansible.builtin.unarchive:
+        src: "{{ nexus }}/raw-keys/root/elastic-agent/elastic-agent-7.16.3-linux-x86_64.tar.gz"
+        dest: /root/elstic-agent
+        remote_src: yes
